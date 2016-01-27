@@ -46,22 +46,27 @@ our $thumbdirText;
 our $thumbdirButton;
 our $thumbdirLabel;
 our $prefapplyButton;
+our $dirWindow;
 
-our $settings;
+our $settings = {
+	source_dir => "",
+	thumb_dir => "",
+};
 our $tagBox;
 our $addtagButton;
 our $tagText;
 
 
-my $source_dir = "/home/cristi/Videos";
-my $thumb_dir = "/home/cristi/Pictures";
-my $log = "/home/cristi/collection.log";
+my $source_dir = $settings->{source_dir};
+my $thumb_dir = $settings->{thumb_dir};
+my $log = "/tmp/collection.log";
+my $config = $ENV{"HOME"} . "/.movie_catalog.json";
 
 &get_settings();
 
 my $data = {};
 
-my $collection = $ENV{"HOME"} . "/collection.json";
+my $collection = $ENV{"HOME"} . "/.collection.json";
 if (-e $collection) {
 	&log("Found collection database $collection.");
 	open my $fh, "<", $collection;
@@ -74,9 +79,14 @@ if (-e $collection) {
 	################################
 	### update_collection();
 } else {
-	&log("No available collection. Will create one.");
-	find(\&get_data, $source_dir);
-	update_collection();
+	if ($source_dir ne "") {
+		&log("No available collection. Will create one.");
+		find(\&get_data, $source_dir);
+		update_collection();
+	} else {
+		&log("Source directory not defined.");
+		$data = {};
+	}
 }
 
 &log("Rendering main window.");
@@ -101,7 +111,6 @@ sub update_collection {
 }
 
 sub get_settings() {
-	my $config = $ENV{"HOME"} . "/.movie_catalog.json";
 	if (-e $config) {
 		&log("Found configuration file $config.");
 		open my $fh, "<", $config;
@@ -111,7 +120,7 @@ sub get_settings() {
 	} else {
 		&log("Configuration file not found. Create empty one.");
 		open my $fh, ">", $config;
-		print $fh "{}";
+		print $fh "{\"source_dir\":\"\",\"thumb_dir\":\"\"}";
 		close $fh;
 	}
 }
@@ -279,15 +288,44 @@ sub add_tag {
 }
 
 sub dirWindow {
+	my $location = shift;
 
+	$dirWindow = Gtk3::FileChooserDialog->new("Please select a folder", $prefWindow, "select-folder", "Cancel", 'cancel', "Select", 'ok' );
+	$dirWindow->set_default_size(800,400);
+
+	my $response = $dirWindow->run();
+	my $dir = '';
+
+	if ($response eq 'ok') {
+		$dir = $dirWindow->get_filename();
+	}
+
+	if ($location eq 'source') {
+		$sourcedirText->set_text($dir);
+	} else {
+		$thumbdirText->set_text($dir);
+	}
+
+	$dirWindow->destroy();
 }
 
 sub save_pref {
+	my $source_dir = $sourcedirText->get_text();
+	my $thumb_dir = $thumbdirText->get_text();
 
+	$settings->{source_dir} = $source_dir;
+	$settings->{thumb_dir} = $thumb_dir;
+
+	open my $fh, ">", $config;
+	my $json = encode_json($settings);
+	print $fh $json;
+	close $fh;
+
+	$prefWindow->destroy();
 }
 
 sub preferences {
-	$prefWindow = Gtk3::Window->new('popup');
+	$prefWindow = Gtk3::Window->new();
 	$prefWindow->set_title('Preferences');
 	$prefWindow->set_border_width(5);
 	$prefWindow->set_default_size(400, 150);
@@ -302,11 +340,13 @@ sub preferences {
 	$thumbdirBox = Gtk3::Box->new('horizontal', 5);
 
 	$sourcedirText = Gtk3::Entry->new();
+	$sourcedirText->set_text($settings->{source_dir});
 	$thumbdirText = Gtk3::Entry->new();
+	$thumbdirText->set_text($settings->{thumb_dir});
 	$sourcedirButton = Gtk3::Button->new_with_label('...');
-	$sourcedirButton->signal_connect(clicked => \&dirWindow, TRUE);
+	$sourcedirButton->signal_connect(clicked => sub {&dirWindow('source');}, TRUE);
 	$thumbdirButton = Gtk3::Button->new_with_label('...');
-	$thumbdirButton->signal_connect(clicked => \&dirWindow, TRUE);
+	$thumbdirButton->signal_connect(clicked => sub {&dirWindow('thumb');}, TRUE);
 
 	$sourcedirBox->pack_start($sourcedirText, TRUE, TRUE, 5);
 	$sourcedirBox->pack_start($sourcedirButton, FALSE, FALSE, 5);
