@@ -1,6 +1,7 @@
 # videocatalog
 Video Catalog
 
+- Gtk3
 - scan source directory
 - generate thumbnails
 - generate montage from thumbnails
