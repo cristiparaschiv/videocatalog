@@ -10,6 +10,10 @@ use Glib 'TRUE', 'FALSE';
 use File::Find;
 use File::Basename;
 use Scalar::Util qw(looks_like_number);
+use DBI;
+
+use threads;
+use threads::shared;
 
 use constant COLUMN_NAME => 0;
 use constant COLUMN_LENGTH => 1;
@@ -48,6 +52,10 @@ our $thumbdirLabel;
 our $prefapplyButton;
 our $dirWindow;
 
+our $progressWindow;
+our $progressBox;
+our $progressBar;
+
 our $settings = {
 	source_dir => "",
 	thumb_dir => "",
@@ -56,42 +64,61 @@ our $tagBox;
 our $addtagButton;
 our $tagText;
 
+my $driver = "SQLite";
+my $database = $ENV{"HOME"} . "/.catalog.db";
+my $dsn = "DBI:$driver:dbname=$database";
+my $userid = '';
+my $password = '';
+my $dbh = DBI->connect($dsn, $userid, $password, {RaiseError => 1}) or &log($DBI::errstr);
+
+my $config = $ENV{"HOME"} . "/.movie_catalog.json";
+my $log = "/tmp/collection.log";
+&get_settings();
 
 my $source_dir = $settings->{source_dir};
 my $thumb_dir = $settings->{thumb_dir};
-my $log = "/tmp/collection.log";
-my $config = $ENV{"HOME"} . "/.movie_catalog.json";
-
-&get_settings();
 
 my $data = {};
+my $file_list = [];
 
-my $collection = $ENV{"HOME"} . "/.collection.json";
-if (-e $collection) {
-	&log("Found collection database $collection.");
-	open my $fh, "<", $collection;
-	my $json = <$fh>;
-	close $fh;
-	$data = decode_json($json);
-
-	### TODO
-	### CHECK SOURCE DIR FOR CHANGES
-	################################
-	### update_collection();
-} else {
-	if ($source_dir ne "") {
-		&log("No available collection. Will create one.");
-		find(\&get_data, $source_dir);
-		update_collection();
-	} else {
-		&log("Source directory not defined.");
-		$data = {};
-	}
-}
+### Load Data from DB
+&load_data();
 
 &log("Rendering main window.");
 &render_window();
 Gtk3->main();
+
+sub load_data {
+	$data = {};
+	my $dbh = DBI->connect($dsn, $userid, $password, {RaiseError => 1}) or &log($DBI::errstr);
+	my $query = qq(SELECT id, name, path, md5, size, length, pictures, attributes, tags FROM videos);
+	my $sth = $dbh->prepare($query);
+	my $rv = $sth->execute();
+	while (my $row = $sth->fetchrow_hashref) {
+		my $size = int($row->{size} / 1024 / 1024) . " MB";
+		my $length = $row->{length} . " s";
+
+		my @imgs = split(',', $row->{pictures});
+		@imgs = sort @imgs;
+
+		$data->{$row->{md5}} = {
+			name => $row->{name},
+			path => $row->{path},
+			md5 => $row->{md5},
+			size => $size,
+			length => $length,
+			imgs => \@imgs,
+			tags => $row->{tags},
+			attributes => $row->{attributes}
+		};
+	}
+	
+	if (keys %$data) {
+		&log("Found video collection.");
+	} else {
+		&log("No video collection found. Scan the source directory.");
+	}
+}
 
 sub log {
 	my $message = shift;
@@ -102,12 +129,43 @@ sub log {
 	close $fh;
 }
 
-sub update_collection {
-	&log("Updating collection.");
-	open my $fh, ">", $collection;
-	my $json = encode_json($data);
-	print $fh $json;
-	close $fh;
+sub update_db {
+	if ($settings->{source_dir} eq "") {
+		return 0;
+	}
+	$progressWindow = Gtk3::Window->new();
+	$progressWindow->set_title('Updating Video Database');
+	$progressWindow->set_border_width(5);
+	$progressWindow->set_default_size(500, 150);
+
+	$progressBox = Gtk3::Box->new('vertical', 5);
+	$progressBar = Gtk3::ProgressBar->new();
+	$progressBar->set_valign('center');
+
+	$progressBox->pack_start($progressBar, TRUE, TRUE, 5);
+
+	$progressWindow->add($progressBox);
+	$progressWindow->show_all;
+
+	threads->create(
+		sub {
+			my $tid = threads->self->tid;
+			&log("Starting update DB thread $tid.");
+
+
+			find(\&get_data, $source_dir);
+			&log("Found " . scalar @$file_list . " files in source directory.");
+			&process_files();
+			
+			&load_data();
+			&log("Ended thread $tid.");
+
+			$progressWindow->close();
+			#Refresh UI List
+			my $model = set_model($data);
+			$tv->set_model($model);
+		}
+	);
 }
 
 sub get_settings() {
@@ -125,21 +183,21 @@ sub get_settings() {
 	}
 }
 
-sub get_data {
-	my $filename = $_;
-	my $file = $File::Find::name;
+sub process_files {
+	my $index = 0;
+	my $dbh = DBI->connect($dsn, $userid, $password, {RaiseError => 1}) or &log($DBI::errstr);
+	my $query = "DELETE FROM videos";
+	$dbh->do($query);
 
-	if (-d $file) {
-		return 0;
-	}
+	foreach my $file (@$file_list) {
+		my $filename = basename($file);
 
-	my $info = "ffprobe -i '$file' -show_format -v quiet | sed -n 's/duration=//p'";
-	my $duration = `$info`;
-	my $size = -s $file;
+		my $info = "ffprobe -i '$file' -show_format -v quiet | sed -n 's/duration=//p'";
+		my $duration = `$info`;
+		my $size = -s $file;
 
-	my $ratio = int($duration/5);
+		my $ratio = int($duration/5);
 
-	if (looks_like_number($duration)) {
 		my $md5 = "md5sum '$file' | awk '{print " . '$1' . "}'";
 		my $md5sum = `$md5`;
 		chop($md5sum);
@@ -157,25 +215,45 @@ sub get_data {
 		}
 
 		my $imgs = [];
+		my $imgs_string = "";
 		opendir(DIR, "$thumb_dir/$md5sum");
 		while (my $file = readdir(DIR)) {
 			my $filename = $t_dir . $file;
 			if (! -d $filename ) {
 				push @$imgs, "$filename";
+				$imgs_string .= "$filename,";
 			}
 		}
 		closedir(DIR);
+		chop($imgs_string);
+
+		$duration = int($duration);
 		
-		my @imgs = sort @$imgs;
-		my $temp = {
-			path => $file,
-			name => $filename,
-			size => int($size/1024/1024) . " MB",
-			length => int($duration) . " s",
-			md5 => $md5sum,
-			imgs => \@imgs,
-		};
-		$data->{$md5sum} = $temp;
+		my $query = qq(INSERT INTO videos (name, path, md5, size, length, pictures, attributes, tags)VALUES ("$filename", "$file", "$md5sum", "$size", "$duration", "$imgs_string", '', ''));
+		$dbh->do($query);
+		
+		$index++;
+		my $proc = $index / scalar(@$file_list);
+		$progressBar->set_fraction($proc);
+		&log("Processed $index / " . scalar(@$file_list) . ".");
+	}
+}
+
+
+sub get_data {
+	my $filename = $_;
+	my $file = $File::Find::name;
+
+	if (-d $file) {
+		return 0;
+	}
+
+	my $info = "ffprobe -i '$file' -show_format -v quiet | sed -n 's/duration=//p'";
+	my $duration = `$info`;
+	my $size = -s $file;
+
+	if (looks_like_number($duration) && $size > 1000000) {
+		push @$file_list, $file;
 	}
 }
 
@@ -208,9 +286,15 @@ sub render_window {
 	my $mitem = Gtk3::MenuItem->new_with_label("Preferences");
 	$mitem->signal_connect('activate' => \&preferences, TRUE);
 	$menu->append($mitem);
+
+	my $mitem2 = Gtk3::MenuItem->new_with_label("Scan library");
+	$mitem2->signal_connect('activate' => \&update_db, TRUE);
+	$menu->append($mitem2);
+
 	my $mb = Gtk3::MenuButton->new();
 	my $img = Gtk3::Image->new_from_icon_name('open-menu-symbolic', 'button');
 	$mitem->show;
+	$mitem2->show;
 	$mb->set_popup($menu);
 	$mb->add($img);
 	$headerBox->pack_start($mb, TRUE, TRUE, 0);
@@ -231,7 +315,6 @@ sub render_window {
 	$tv = Gtk3::TreeView->new($model);
 	$tv->set_rules_hint(TRUE);
 	$tv->set_search_column(COLUMN_NAME);
-#	$tv->signal_connect(button_press_event => sub {&action(@_);});
 	$tv->signal_connect(row_activated => sub {&action(@_);});
 	$sw->add($tv);
 	add_columns($tv);
@@ -310,8 +393,8 @@ sub dirWindow {
 }
 
 sub save_pref {
-	my $source_dir = $sourcedirText->get_text();
-	my $thumb_dir = $thumbdirText->get_text();
+	$source_dir = $sourcedirText->get_text();
+	$thumb_dir = $thumbdirText->get_text();
 
 	$settings->{source_dir} = $source_dir;
 	$settings->{thumb_dir} = $thumb_dir;
@@ -418,6 +501,11 @@ sub get_pic_list {
 	my $iter = shift;
 
 	my $md5 = $model->get_value($iter, 4);
+
+	if (! keys %{$data->{$md5}}) {
+		&load_data();
+	}
+
 	my $imgs = $data->{$md5}->{imgs};
 
 	return $imgs;
@@ -431,8 +519,11 @@ sub action {
 	my $model = $tv->get_model();
 	my $iter = $model->get_iter($path);
 
-	$toplay = $model->get_value($iter, 3);
+	if (!keys %$data) {
+		&load_data;
+	}
 
+	$toplay = $model->get_value($iter, 3);
 	&enable_buttons();
 	$imgs = &get_pic_list($model, $iter);
 
